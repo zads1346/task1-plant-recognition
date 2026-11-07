@@ -1,0 +1,1225 @@
+"""
+Kaggle task2 plant classification, option C.
+
+Stage 1:
+  EfficientNet-B2 + ConvNeXt-Tiny + ResNet50 at 288px
+  5-fold stratified CV, TTA, OOF probability evaluation, architecture ensemble.
+  Training includes stochastic green-foreground cropping, MixUp, and warm-up EMA.
+
+Stage 2:
+  Select only high-confidence pseudo labels where all three architectures agree.
+  Fine-tune one full-data student per architecture with soft pseudo targets.
+  Blend teacher and student probabilities and write one final submission.csv.
+
+Expected Kaggle paths:
+  /kaggle/input/competitions/2026task1/dataset-for-task2/dataset-for-task2/train
+  /kaggle/input/competitions/2026task1/dataset-for-task2/dataset-for-task2/test
+  /kaggle/input/competitions/2026task1/submission-for-task2.csv
+
+Internet must be enabled in Kaggle for the first download of ImageNet weights.
+The script intentionally raises an error instead of silently training from
+random initialization when pretrained weights cannot be loaded.
+"""
+
+from __future__ import annotations
+
+from contextlib import nullcontext
+from pathlib import Path
+import copy
+import gc
+import os
+import random
+import time
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import datasets, models, transforms
+from torchvision.transforms import InterpolationMode
+
+from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+SEED = int(os.environ.get("PLANT_SEED", "42"))
+N_SPLITS = int(os.environ.get("PLANT_N_SPLITS", "5"))
+IMAGE_SIZE = int(os.environ.get("PLANT_IMAGE_SIZE", "288"))
+NUM_WORKERS = max(0, int(os.environ.get("PLANT_NUM_WORKERS", "2")))
+FREEZE_EPOCHS = int(os.environ.get("PLANT_FREEZE_EPOCHS", "2"))
+PATIENCE = int(os.environ.get("PLANT_PATIENCE", "5"))
+PSEUDO_THRESHOLD = 0.97  # replaced by OOF calibration when possible
+PSEUDO_MARGIN = 0.30    # replaced by OOF calibration when possible
+PSEUDO_EPOCHS = int(os.environ.get("PLANT_PSEUDO_EPOCHS", "6"))
+PSEUDO_BLEND = float(os.environ.get("PLANT_PSEUDO_BLEND", "0.30"))
+MIXUP_ALPHA = 0.20
+MIXUP_PROB = 0.35
+EMA_DECAY = 0.995
+HIGHRES_SIZE = int(os.environ.get("PLANT_HIGHRES_SIZE", "320"))
+HIGHRES_WEIGHT = 0.20
+# Number of geometric TTA views evaluated in one forward pass. A value of 2
+# cuts inference overhead substantially without creating a large temporary
+# tensor on the Kaggle GPU.
+TTA_VIEW_BATCH = max(1, int(os.environ.get("PLANT_TTA_VIEW_BATCH", "2")))
+ENABLE_STAGE2 = os.environ.get("PLANT_ENABLE_STAGE2", "1") == "1"
+# The original script used micro-F1, which equals accuracy for single-label
+# multiclass classification. Change to "macro_f1" if the leaderboard metric is
+# explicitly macro-F1.
+CHECKPOINT_METRIC = "accuracy"
+KEEP_ALL_FOLD_CHECKPOINTS = False
+
+BASE_DIR = Path(
+    "/kaggle/input/competitions/2026task1/"
+    "dataset-for-task2/dataset-for-task2"
+)
+TRAIN_DIR = BASE_DIR / "train"
+TEST_DIR = BASE_DIR / "test"
+SUBMISSION_PATH = Path(
+    "/kaggle/input/competitions/2026task1/submission-for-task2.csv"
+)
+OUTPUT_DIR = Path("/kaggle/working/plant_option_c_v3_optimized")
+MODEL_DIR = OUTPUT_DIR / "models"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+ARCH_CONFIG = {
+    "efficientnet_b2": {
+        "batch_size": 16,
+        "epochs": 18,
+        "backbone_lr": 8e-5,
+        "head_lr": 6e-4,
+    },
+    "convnext_tiny": {
+        "batch_size": 8,
+        "epochs": 16,
+        "backbone_lr": 5e-5,
+        "head_lr": 5e-4,
+    },
+    "resnet50": {
+        "batch_size": 12,
+        "epochs": 18,
+        "backbone_lr": 7e-5,
+        "head_lr": 6e-4,
+    },
+}
+ARCHITECTURES = tuple(ARCH_CONFIG)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+# -----------------------------------------------------------------------------
+# Reproducibility, paths, and transforms
+# -----------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+set_seed(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = DEVICE.type == "cuda"
+if USE_AMP:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except (AttributeError, RuntimeError):
+    pass
+
+print("Device:", DEVICE)
+if USE_AMP:
+    print("GPU:", torch.cuda.get_device_name(0))
+
+assert TRAIN_DIR.is_dir(), f"Missing train directory: {TRAIN_DIR}"
+assert TEST_DIR.is_dir(), f"Missing test directory: {TEST_DIR}"
+assert SUBMISSION_PATH.is_file(), f"Missing submission template: {SUBMISSION_PATH}"
+
+
+class PlantForegroundCrop:
+    """Crop a likely green plant region while retaining a safety margin."""
+
+    def __init__(self, margin=0.18, min_area=0.015):
+        self.margin = margin
+        self.min_area = min_area
+
+    def __call__(self, image):
+        rgb = np.asarray(image.convert("RGB"))
+        hsv = np.asarray(image.convert("HSV"))
+        hue, saturation, value = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        # PIL hue is 0..255. This broad band captures green leaves and stems.
+        mask = (
+            (hue >= 25) & (hue <= 125)
+            & (saturation >= 28)
+            & (value >= 25)
+        )
+        if mask.mean() < self.min_area:
+            return image
+        ys, xs = np.where(mask)
+        if len(xs) < 10:
+            return image
+        h, w = rgb.shape[:2]
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        dx = int((x2 - x1) * self.margin)
+        dy = int((y2 - y1) * self.margin)
+        x1, x2 = max(0, x1 - dx), min(w, x2 + dx)
+        y1, y2 = max(0, y1 - dy), min(h, y2 + dy)
+        if (x2 - x1) * (y2 - y1) < 0.08 * w * h:
+            return image
+        return image.crop((x1, y1, x2, y2))
+
+
+foreground_crop = PlantForegroundCrop()
+
+train_transform = transforms.Compose([
+    transforms.RandomApply([foreground_crop], p=0.45),
+    transforms.RandomResizedCrop(
+        IMAGE_SIZE,
+        scale=(0.75, 1.0),
+        ratio=(0.88, 1.12),
+        interpolation=InterpolationMode.BICUBIC,
+    ),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(
+        degrees=20,
+        interpolation=InterpolationMode.BILINEAR,
+        fill=0,
+    ),
+    transforms.ColorJitter(
+        brightness=0.15,
+        contrast=0.15,
+        saturation=0.15,
+        hue=0.03,
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    transforms.RandomErasing(
+        p=0.10,
+        scale=(0.02, 0.08),
+        ratio=(0.5, 2.0),
+        value="random",
+    ),
+])
+
+eval_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+highres_eval_transform = transforms.Compose([
+    transforms.Resize((HIGHRES_SIZE, HIGHRES_SIZE), interpolation=InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+crop_eval_transform = transforms.Compose([
+    foreground_crop,
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+highres_crop_eval_transform = transforms.Compose([
+    foreground_crop,
+    transforms.Resize((HIGHRES_SIZE, HIGHRES_SIZE), interpolation=InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+
+# -----------------------------------------------------------------------------
+# Datasets. Test files follow the submission template order exactly.
+# -----------------------------------------------------------------------------
+
+base_dataset = datasets.ImageFolder(str(TRAIN_DIR))
+CLASS_NAMES = list(base_dataset.classes)
+CLASS_TO_IDX = dict(base_dataset.class_to_idx)
+NUM_CLASSES = len(CLASS_NAMES)
+assert NUM_CLASSES == 5, f"Expected 5 classes, found {NUM_CLASSES}: {CLASS_NAMES}"
+
+print("Classes:", CLASS_NAMES)
+print("Class counts:", np.bincount(base_dataset.targets).tolist())
+
+train_dataset_full = datasets.ImageFolder(
+    str(TRAIN_DIR),
+    transform=train_transform,
+)
+valid_dataset_full = datasets.ImageFolder(
+    str(TRAIN_DIR),
+    transform=eval_transform,
+)
+valid_crop_dataset_full = datasets.ImageFolder(
+    str(TRAIN_DIR),
+    transform=crop_eval_transform,
+)
+assert train_dataset_full.class_to_idx == CLASS_TO_IDX
+assert valid_dataset_full.class_to_idx == CLASS_TO_IDX
+assert valid_crop_dataset_full.class_to_idx == CLASS_TO_IDX
+
+
+class OrderedTestDataset(Dataset):
+    def __init__(self, paths: list[Path], transform):
+        self.paths = paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        image = Image.open(path).convert("RGB")
+        return self.transform(image), path.name
+
+
+submission_template = pd.read_csv(SUBMISSION_PATH, dtype={"ID": str})
+assert submission_template.columns.tolist() == ["ID", "Category"]
+assert submission_template["ID"].is_unique
+
+test_paths = [TEST_DIR / image_id for image_id in submission_template["ID"]]
+assert all(path.is_file() for path in test_paths), "A submission ID is missing from test/"
+test_dataset = OrderedTestDataset(test_paths, eval_transform)
+test_crop_dataset = OrderedTestDataset(test_paths, crop_eval_transform)
+test_highres_dataset = OrderedTestDataset(test_paths, highres_eval_transform)
+test_highres_crop_dataset = OrderedTestDataset(test_paths, highres_crop_eval_transform)
+print("Train images:", len(base_dataset))
+print("Test images:", len(test_dataset))
+
+
+def loader(dataset, batch_size, shuffle=False):
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=USE_AMP,
+        drop_last=False,
+    )
+    if NUM_WORKERS > 0:
+        # Persistent workers avoid respawning Python workers for every fold,
+        # while the explicit prefetch keeps GPU input pipelines full.
+        kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+    return DataLoader(**kwargs)
+
+
+# -----------------------------------------------------------------------------
+# Models and AMP compatibility
+# -----------------------------------------------------------------------------
+
+def build_model(architecture: str, pretrained: bool = True) -> nn.Module:
+    if architecture == "efficientnet_b2":
+        try:
+            weights = models.EfficientNet_B2_Weights.DEFAULT if pretrained else None
+            model = models.efficientnet_b2(weights=weights)
+        except Exception as exc:
+            raise RuntimeError(
+                "EfficientNet-B2 weights could not be loaded. Enable Kaggle Internet "
+                "or add the pretrained weights as a Notebook input."
+            ) from exc
+        in_features = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Sequential(
+            nn.Dropout(0.20),
+            nn.Linear(in_features, NUM_CLASSES),
+        )
+
+    elif architecture == "convnext_tiny":
+        try:
+            weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+            model = models.convnext_tiny(weights=weights)
+        except Exception as exc:
+            raise RuntimeError(
+                "ConvNeXt-Tiny weights could not be loaded. Enable Kaggle Internet "
+                "or add the pretrained weights as a Notebook input."
+            ) from exc
+        in_features = model.classifier[-1].in_features
+        # Keep the original LayerNorm + Flatten; replace only the classifier layer.
+        model.classifier[-1] = nn.Sequential(
+            nn.Dropout(0.30),
+            nn.Linear(in_features, NUM_CLASSES),
+        )
+
+    elif architecture == "resnet50":
+        try:
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            model = models.resnet50(weights=weights)
+        except Exception as exc:
+            raise RuntimeError(
+                "ResNet50 weights could not be loaded. Enable Kaggle Internet "
+                "or add the pretrained weights as a Notebook input."
+            ) from exc
+        in_features = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Dropout(0.30),
+            nn.Linear(in_features, NUM_CLASSES),
+        )
+
+    else:
+        raise ValueError(f"Unknown architecture: {architecture}")
+
+    return model.to(DEVICE)
+
+
+def is_head_parameter(architecture: str, name: str) -> bool:
+    return name.startswith("classifier") if architecture != "resnet50" else name.startswith("fc")
+
+
+def set_backbone_trainable(model: nn.Module, architecture: str, trainable: bool) -> None:
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = trainable or is_head_parameter(architecture, name)
+
+
+def freeze_batch_norm(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+
+def autocast_context():
+    if USE_AMP:
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def make_scaler():
+    try:
+        return torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=USE_AMP)
+
+
+def load_state(path: Path):
+    try:
+        return torch.load(path, map_location=DEVICE, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=DEVICE)
+
+
+# -----------------------------------------------------------------------------
+# Training, validation, and TTA
+# -----------------------------------------------------------------------------
+
+def make_optimizer(model: nn.Module, architecture: str, scale: float = 1.0):
+    cfg = ARCH_CONFIG[architecture]
+    head, backbone = [], []
+    for name, parameter in model.named_parameters():
+        (head if is_head_parameter(architecture, name) else backbone).append(parameter)
+    return torch.optim.AdamW(
+        [
+            {"params": backbone, "lr": cfg["backbone_lr"] * scale},
+            {"params": head, "lr": cfg["head_lr"] * scale},
+        ],
+        weight_decay=1e-4,
+    )
+
+
+class ModelEMA:
+    def __init__(self, model, decay=EMA_DECAY):
+        self.module = copy.deepcopy(model).eval()
+        self.decay = decay
+        self.num_updates = 0
+        for parameter in self.module.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        # Warm up the EMA decay so a freshly initialized classifier head is not
+        # dominated by random values during the first few hundred updates.
+        decay = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        ema_state = self.module.state_dict()
+        model_state = model.state_dict()
+        for key, ema_value in ema_state.items():
+            model_value = model_state[key].detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
+            else:
+                ema_value.copy_(model_value)
+
+    def state_dict(self):
+        return self.module.state_dict()
+
+
+def soft_cross_entropy(logits, targets):
+    return -(targets * F.log_softmax(logits.float(), dim=1)).sum(dim=1).mean()
+
+
+def train_epoch(
+    model,
+    data_loader,
+    optimizer,
+    scaler,
+    criterion,
+    freeze_backbone,
+    ema=None,
+):
+    model.train()
+    if freeze_backbone:
+        freeze_batch_norm(model)
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for images, labels in data_loader:
+        images = images.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        use_mixup = MIXUP_PROB > 0.0 and random.random() < MIXUP_PROB
+        if use_mixup:
+            lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+            permutation = torch.randperm(images.size(0), device=images.device)
+            mixed_images = lam * images + (1.0 - lam) * images[permutation]
+            one_hot = F.one_hot(labels, NUM_CLASSES).float()
+            one_hot = one_hot * (1.0 - 0.05) + 0.05 / NUM_CLASSES
+            mixed_targets = lam * one_hot + (1.0 - lam) * one_hot[permutation]
+        else:
+            mixed_images = images
+            mixed_targets = None
+        with autocast_context():
+            logits = model(mixed_images)
+            loss = (
+                soft_cross_entropy(logits, mixed_targets)
+                if mixed_targets is not None
+                else criterion(logits, labels)
+            )
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        scaler.step(optimizer)
+        scaler.update()
+        if ema is not None:
+            ema.update(model)
+        running_loss += loss.item() * labels.size(0)
+        correct += (logits.argmax(1) == labels).sum().item()
+        total += labels.size(0)
+
+    return running_loss / total, correct / total
+
+
+@torch.inference_mode()
+def evaluate(model, data_loader, criterion):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    all_predictions = []
+    all_labels = []
+    for images, labels in data_loader:
+        images = images.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+        with autocast_context():
+            logits = model(images)
+            loss = criterion(logits, labels)
+        running_loss += loss.item() * labels.size(0)
+        correct += (logits.argmax(1) == labels).sum().item()
+        total += labels.size(0)
+        all_predictions.append(logits.argmax(1).cpu().numpy())
+        all_labels.append(labels.cpu().numpy())
+    predictions = np.concatenate(all_predictions)
+    labels_np = np.concatenate(all_labels)
+    macro_f1 = f1_score(labels_np, predictions, average="macro", zero_division=0)
+    return running_loss / total, correct / total, float(macro_f1)
+
+
+def tta_views(images):
+    # Plant seedlings are photographed from above; D4-style flips/rotations are safe.
+    return [
+        images,
+        torch.flip(images, dims=[3]),
+        torch.flip(images, dims=[2]),
+        torch.flip(images, dims=[2, 3]),
+        torch.rot90(images, 1, dims=[2, 3]),
+        torch.rot90(images, 2, dims=[2, 3]),
+        torch.rot90(images, 3, dims=[2, 3]),
+    ]
+
+
+@torch.inference_mode()
+def predict_view_probs(model, images, views=None):
+    """Average TTA probabilities with bounded GPU memory.
+
+    The previous implementation launched one model call per view. Grouping a
+    few views into each call reduces Python/Kernel launch overhead while the
+    configurable chunk size prevents a large temporary tensor from causing an
+    out-of-memory error on smaller Kaggle GPUs.
+    """
+    views = tta_views(images) if views is None else views
+    batch_size = images.shape[0]
+    probability_sum = torch.zeros(
+        batch_size,
+        NUM_CLASSES,
+        device=images.device,
+        dtype=torch.float32,
+    )
+    for start in range(0, len(views), TTA_VIEW_BATCH):
+        view_chunk = views[start:start + TTA_VIEW_BATCH]
+        stacked = torch.cat(view_chunk, dim=0)
+        with autocast_context():
+            logits = model(stacked)
+        probs = torch.softmax(logits.float(), dim=1)
+        probability_sum += probs.view(len(view_chunk), batch_size, -1).sum(dim=0)
+    return probability_sum / float(len(views))
+
+
+@torch.inference_mode()
+def predict_test_tta(
+    model,
+    data_loader,
+    crop_loader=None,
+    highres_loader=None,
+    highres_crop_loader=None,
+):
+    model.eval()
+    all_probs = []
+    all_ids = []
+    crop_iter = iter(crop_loader) if crop_loader is not None else None
+    highres_iter = iter(highres_loader) if highres_loader is not None else None
+    highres_crop_iter = (
+        iter(highres_crop_loader) if highres_crop_loader is not None else None
+    )
+    for images, ids in data_loader:
+        images = images.to(DEVICE, non_blocking=True)
+        probability = predict_view_probs(model, images)
+        if crop_iter is not None:
+            crop_images, crop_ids = next(crop_iter)
+            assert list(crop_ids) == list(ids)
+            crop_images = crop_images.to(DEVICE, non_blocking=True)
+            crop_probability = predict_view_probs(model, crop_images)
+            probability = 0.5 * (probability + crop_probability)
+        if highres_iter is not None:
+            highres_images, highres_ids = next(highres_iter)
+            assert list(highres_ids) == list(ids)
+            highres_images = highres_images.to(DEVICE, non_blocking=True)
+            highres_views = [highres_images, torch.flip(highres_images, dims=[3])]
+            highres_probability = predict_view_probs(
+                model,
+                highres_images,
+                views=highres_views,
+            )
+            if highres_crop_iter is not None:
+                highres_crop_images, highres_crop_ids = next(highres_crop_iter)
+                assert list(highres_crop_ids) == list(ids)
+                highres_crop_images = highres_crop_images.to(DEVICE, non_blocking=True)
+                highres_crop_views = [
+                    highres_crop_images,
+                    torch.flip(highres_crop_images, dims=[3]),
+                ]
+                highres_crop_probability = predict_view_probs(
+                    model,
+                    highres_crop_images,
+                    views=highres_crop_views,
+                )
+                highres_probability = 0.5 * (
+                    highres_probability + highres_crop_probability
+                )
+            probability = (
+                (1.0 - HIGHRES_WEIGHT) * probability
+                + HIGHRES_WEIGHT * highres_probability
+            )
+        all_probs.append(probability.cpu().numpy())
+        all_ids.extend(list(ids))
+    return np.concatenate(all_probs, axis=0), all_ids
+
+
+@torch.inference_mode()
+def predict_validation(model, data_loader, crop_loader=None):
+    model.eval()
+    all_probs = []
+    crop_iter = iter(crop_loader) if crop_loader is not None else None
+    for images, _labels in data_loader:
+        images = images.to(DEVICE, non_blocking=True)
+        probability = predict_view_probs(model, images)
+        if crop_iter is not None:
+            crop_images, crop_labels = next(crop_iter)
+            crop_images = crop_images.to(DEVICE, non_blocking=True)
+            assert torch.equal(crop_labels, _labels)
+            crop_probability = predict_view_probs(model, crop_images)
+            probability = 0.5 * (probability + crop_probability)
+        all_probs.append(probability.cpu().numpy())
+    return np.concatenate(all_probs, axis=0)
+
+
+# -----------------------------------------------------------------------------
+# Stage 1: 15 teacher models and OOF ensemble
+# -----------------------------------------------------------------------------
+
+targets = np.asarray(base_dataset.targets)
+folds = list(StratifiedKFold(
+    n_splits=N_SPLITS,
+    shuffle=True,
+    random_state=SEED,
+).split(np.zeros(len(targets)), targets))
+
+teacher_oof = {}
+teacher_test = {}
+teacher_scores = {}
+best_paths = {}
+best_fold_scores = {}
+
+overall_start = time.time()
+
+for architecture in ARCHITECTURES:
+    print("\n" + "=" * 80)
+    print("ARCHITECTURE:", architecture)
+    print("=" * 80)
+    oof_probs = np.zeros((len(base_dataset), NUM_CLASSES), dtype=np.float32)
+    test_prob_sum = np.zeros((len(test_dataset), NUM_CLASSES), dtype=np.float32)
+    fold_scores = []
+    fold_paths = []
+
+    for fold_number, (train_idx, valid_idx) in enumerate(folds, start=1):
+        print(f"\n{architecture} | Fold {fold_number}/{N_SPLITS}")
+        set_seed(SEED + fold_number)
+        inference_batch_size = min(16, ARCH_CONFIG[architecture]["batch_size"])
+        train_loader = loader(
+            Subset(train_dataset_full, train_idx),
+            ARCH_CONFIG[architecture]["batch_size"],
+            shuffle=True,
+        )
+        valid_loader = loader(
+            Subset(valid_dataset_full, valid_idx),
+            16,
+            shuffle=False,
+        )
+        valid_crop_loader = loader(
+            Subset(valid_crop_dataset_full, valid_idx),
+            16,
+            shuffle=False,
+        )
+        test_loader = loader(test_dataset, inference_batch_size, shuffle=False)
+        test_crop_loader = loader(
+            test_crop_dataset,
+            inference_batch_size,
+            shuffle=False,
+        )
+        test_highres_loader = loader(
+            test_highres_dataset,
+            inference_batch_size,
+            shuffle=False,
+        )
+        test_highres_crop_loader = loader(
+            test_highres_crop_dataset,
+            inference_batch_size,
+            shuffle=False,
+        )
+
+        model = build_model(architecture, pretrained=True)
+        ema = ModelEMA(model, decay=EMA_DECAY)
+        set_backbone_trainable(model, architecture, trainable=False)
+        optimizer = make_optimizer(model, architecture)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            # Keep the head warm during the frozen-backbone phase, then spend
+            # the cosine schedule on the epochs that update the backbone.
+            T_max=max(1, ARCH_CONFIG[architecture]["epochs"] - FREEZE_EPOCHS),
+            eta_min=1e-6,
+        )
+        scaler = make_scaler()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        best_score = -1.0
+        best_loss = float("inf")
+        no_improve = 0
+        checkpoint_path = MODEL_DIR / f"{architecture}_fold{fold_number}.pth"
+
+        for epoch in range(1, ARCH_CONFIG[architecture]["epochs"] + 1):
+            if epoch == FREEZE_EPOCHS + 1:
+                set_backbone_trainable(model, architecture, trainable=True)
+            train_loss, train_acc = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                criterion,
+                freeze_backbone=epoch <= FREEZE_EPOCHS,
+                ema=ema,
+            )
+            valid_loss, valid_acc, valid_macro_f1 = evaluate(
+                ema.module,
+                valid_loader,
+                criterion,
+            )
+            if epoch > FREEZE_EPOCHS:
+                scheduler.step()
+            print(
+                f"epoch {epoch:02d} | train {train_acc:.4f} | "
+                f"valid_acc {valid_acc:.4f} | valid_macro_f1 {valid_macro_f1:.4f} | "
+                f"loss {valid_loss:.4f}"
+            )
+            selection_score = (
+                valid_macro_f1
+                if CHECKPOINT_METRIC == "macro_f1"
+                else valid_acc
+            )
+            better = selection_score > best_score or (
+                abs(selection_score - best_score) < 1e-10
+                and valid_loss < best_loss
+            )
+            if better:
+                best_score = selection_score
+                best_loss = valid_loss
+                no_improve = 0
+                torch.save(ema.state_dict(), checkpoint_path)
+            else:
+                no_improve += 1
+            if no_improve >= PATIENCE:
+                print("early stopping")
+                break
+
+        fold_scores.append(best_score)
+        fold_paths.append(checkpoint_path)
+        model.load_state_dict(load_state(checkpoint_path))
+        oof_probs[valid_idx] = predict_validation(
+            model,
+            valid_loader,
+            valid_crop_loader,
+        )
+        fold_test_probs, test_ids_seen = predict_test_tta(
+            model,
+            test_loader,
+            test_crop_loader,
+            test_highres_loader,
+            test_highres_crop_loader,
+        )
+        assert test_ids_seen == submission_template["ID"].tolist()
+        test_prob_sum += fold_test_probs
+        print(f"best fold score: {best_score:.4f}")
+
+        del model, ema, optimizer, scheduler, scaler
+        del (
+            train_loader,
+            valid_loader,
+            valid_crop_loader,
+            test_loader,
+            test_crop_loader,
+            test_highres_loader,
+            test_highres_crop_loader,
+        )
+        gc.collect()
+        if USE_AMP:
+            torch.cuda.empty_cache()
+
+    teacher_oof[architecture] = oof_probs
+    teacher_test[architecture] = test_prob_sum / N_SPLITS
+    teacher_scores[architecture] = float(f1_score(
+        targets,
+        oof_probs.argmax(1),
+        average="macro",
+        zero_division=0,
+    ))
+    teacher_accuracy = float((oof_probs.argmax(1) == targets).mean())
+    best_fold_scores[architecture] = max(fold_scores)
+    best_paths[architecture] = fold_paths[int(np.argmax(fold_scores))]
+    print(
+        architecture,
+        "fold mean:", round(float(np.mean(fold_scores)), 4),
+        "OOF macro-F1:", round(teacher_scores[architecture], 4),
+        "OOF accuracy:", round(teacher_accuracy, 4),
+    )
+    if not KEEP_ALL_FOLD_CHECKPOINTS:
+        for path in fold_paths:
+            if path != best_paths[architecture] and path.exists():
+                path.unlink()
+
+
+def search_oof_weights(oof_by_arch, y, step=0.05, metric="macro"):
+    names = list(oof_by_arch)
+    best = (None, -1.0)
+    # Keep every architecture represented; 500 OOF samples are too few for
+    # an unconstrained weight search to be reliable.
+    grid = np.arange(0.15, 0.60 + step / 2, step)
+    for w0 in grid:
+        for w1 in grid:
+            w2 = 1.0 - w0 - w1
+            if w2 < 0.15 - 1e-8 or w2 > 0.60 + 1e-8:
+                continue
+            weights = np.array([w0, w1, w2])
+            probs = sum(weights[i] * oof_by_arch[names[i]] for i in range(3))
+            score = f1_score(
+                y,
+                probs.argmax(1),
+                average="macro" if metric == "macro" else "micro",
+                zero_division=0,
+            )
+            if score > best[1]:
+                best = (weights, float(score))
+    return names, best[0], best[1]
+
+
+arch_names, arch_weights_macro, oof_macro_score = search_oof_weights(
+    teacher_oof,
+    targets,
+    metric="macro",
+)
+_, arch_weights_accuracy, oof_accuracy_score = search_oof_weights(
+    teacher_oof,
+    targets,
+    metric="micro",
+)
+arch_weights = (
+    arch_weights_macro
+    if CHECKPOINT_METRIC == "macro_f1"
+    else arch_weights_accuracy
+)
+print("\nOOF architecture scores:", teacher_scores)
+print(
+    "OOF macro-selected weights:",
+    dict(zip(arch_names, arch_weights_macro.round(3))),
+)
+print("OOF macro-F1:", round(oof_macro_score, 4))
+print(
+    "OOF accuracy-selected weights:",
+    dict(zip(arch_names, arch_weights_accuracy.round(3))),
+)
+print("OOF accuracy:", round(oof_accuracy_score, 4))
+
+oof_teacher_probs = sum(
+    arch_weights[i] * teacher_oof[arch_names[i]]
+    for i in range(len(arch_names))
+)
+oof_arch_predictions = np.stack(
+    [teacher_oof[name].argmax(1) for name in arch_names],
+    axis=1,
+)
+oof_agreement = np.all(
+    oof_arch_predictions == oof_arch_predictions[:, :1],
+    axis=1,
+)
+oof_confidence = oof_teacher_probs.max(1)
+oof_sorted = np.sort(oof_teacher_probs, axis=1)
+oof_margin = oof_sorted[:, -1] - oof_sorted[:, -2]
+oof_prediction = oof_teacher_probs.argmax(1)
+
+
+def apply_logit_bias(probabilities, bias):
+    logits = np.log(np.clip(probabilities, 1e-8, 1.0)) + np.asarray(bias)
+    logits -= logits.max(axis=1, keepdims=True)
+    result = np.exp(logits)
+    return result / result.sum(axis=1, keepdims=True)
+
+
+def optimize_class_bias(probabilities, labels, passes=3):
+    bias = np.zeros(NUM_CLASSES, dtype=np.float32)
+    best_score = f1_score(
+        labels,
+        probabilities.argmax(1),
+        average="macro",
+        zero_division=0,
+    )
+    # A small coordinate search is safer than fitting a high-capacity
+    # calibration model on a modest OOF set.
+    candidates = np.linspace(-0.30, 0.30, 13)
+    for _ in range(passes):
+        improved = False
+        for class_index in range(NUM_CLASSES):
+            local_best = best_score
+            local_value = bias[class_index]
+            for value in candidates:
+                trial = bias.copy()
+                trial[class_index] = value
+                score = f1_score(
+                    labels,
+                    apply_logit_bias(probabilities, trial).argmax(1),
+                    average="macro",
+                    zero_division=0,
+                )
+                if score > local_best + 1e-8:
+                    local_best = score
+                    local_value = value
+            if local_value != bias[class_index]:
+                bias[class_index] = local_value
+                best_score = local_best
+                improved = True
+        if not improved:
+            break
+    return bias, float(best_score)
+
+
+oof_bias, calibrated_oof_macro = optimize_class_bias(
+    oof_teacher_probs,
+    targets,
+)
+print(
+    "OOF class-bias calibration:",
+    np.round(oof_bias, 3).tolist(),
+    "macro-F1:",
+    round(calibrated_oof_macro, 4),
+)
+
+# Calibrate pseudo-label thresholds on OOF predictions rather than lowering
+# the test threshold by guesswork. Prefer the largest safe candidate set.
+calibrated = None
+for threshold in np.arange(0.90, 0.996, 0.005):
+    for margin in np.arange(0.10, 0.451, 0.025):
+        mask = oof_agreement & (oof_confidence >= threshold) & (oof_margin >= margin)
+        count = int(mask.sum())
+        if count < 10:
+            continue
+        precision = float((oof_prediction[mask] == targets[mask]).mean())
+        if precision >= 0.98:
+            candidate = (count, -threshold, -margin, precision, threshold, margin)
+            if calibrated is None or candidate > calibrated:
+                calibrated = candidate
+
+if calibrated is not None:
+    _, _, _, oof_pseudo_precision, PSEUDO_THRESHOLD, PSEUDO_MARGIN = calibrated
+    print(
+        "OOF calibrated pseudo thresholds:",
+        f"threshold={PSEUDO_THRESHOLD:.3f}",
+        f"margin={PSEUDO_MARGIN:.3f}",
+        f"estimated precision={oof_pseudo_precision:.4f}",
+    )
+else:
+    PSEUDO_THRESHOLD, PSEUDO_MARGIN = 0.98, 0.30
+    print("No OOF threshold reached 98% precision; using conservative 0.98/0.30.")
+
+teacher_probs = sum(
+    arch_weights[i] * teacher_test[arch_names[i]]
+    for i in range(len(arch_names))
+)
+teacher_probs_macro = sum(
+    arch_weights_macro[i] * teacher_test[arch_names[i]]
+    for i in range(len(arch_names))
+)
+teacher_probs_accuracy = sum(
+    arch_weights_accuracy[i] * teacher_test[arch_names[i]]
+    for i in range(len(arch_names))
+)
+teacher_probs_calibrated = apply_logit_bias(teacher_probs_macro, oof_bias)
+teacher_pred = teacher_probs.argmax(1)
+teacher_conf = teacher_probs.max(1)
+teacher_sorted = np.sort(teacher_probs, axis=1)
+teacher_margin = teacher_sorted[:, -1] - teacher_sorted[:, -2]
+arch_predictions = np.stack(
+    [teacher_test[name].argmax(1) for name in arch_names],
+    axis=1,
+)
+agreement = np.all(arch_predictions == arch_predictions[:, :1], axis=1)
+
+selected_mask = (
+    agreement
+    & (teacher_conf >= PSEUDO_THRESHOLD)
+    & (teacher_margin >= PSEUDO_MARGIN)
+)
+selected_indices = np.flatnonzero(selected_mask)
+print(
+    f"Pseudo-label candidates: {len(selected_indices)}/{len(test_dataset)} "
+    f"(threshold={PSEUDO_THRESHOLD}, margin={PSEUDO_MARGIN})"
+)
+
+
+# -----------------------------------------------------------------------------
+# Stage 2: full-data soft pseudo-label fine-tuning
+# -----------------------------------------------------------------------------
+
+def sharpen(probabilities, temperature=0.60):
+    result = np.power(np.clip(probabilities, 1e-8, 1.0), 1.0 / temperature)
+    return result / result.sum(axis=1, keepdims=True)
+
+
+class SoftTargetDataset(Dataset):
+    def __init__(self, items, transform):
+        self.items = items
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        path, target, weight = self.items[index]
+        image = Image.open(path).convert("RGB")
+        image = self.transform(image)
+        return (
+            image,
+            torch.tensor(target, dtype=torch.float32),
+            torch.tensor(weight, dtype=torch.float32),
+        )
+
+
+def make_soft_items():
+    items = []
+    smoothing = 0.02
+    for path, label in base_dataset.samples:
+        target = np.full(NUM_CLASSES, smoothing / NUM_CLASSES, dtype=np.float32)
+        target[label] = 1.0 - smoothing + smoothing / NUM_CLASSES
+        items.append((Path(path), target, 1.0))
+
+    if len(selected_indices) == 0:
+        return items
+
+    pseudo_prob = sharpen(teacher_probs[selected_indices])
+    for local_idx, image_index in enumerate(selected_indices):
+        confidence = float(teacher_conf[image_index])
+        weight = float(np.clip(
+            0.35 + 0.65 * (confidence - PSEUDO_THRESHOLD) / (1.0 - PSEUDO_THRESHOLD),
+            0.35,
+            1.0,
+        ))
+        items.append((
+            test_paths[image_index],
+            pseudo_prob[local_idx].astype(np.float32),
+            weight,
+        ))
+    return items
+
+
+def train_soft_epoch(model, data_loader, optimizer, scaler, ema=None):
+    model.train()
+    total_loss = 0.0
+    total_weight = 0.0
+    for images, target_probs, sample_weights in data_loader:
+        images = images.to(DEVICE, non_blocking=True)
+        target_probs = target_probs.to(DEVICE, non_blocking=True)
+        sample_weights = sample_weights.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context():
+            logits = model(images)
+            per_item = -(
+                target_probs * F.log_softmax(logits.float(), dim=1)
+            ).sum(dim=1)
+            loss = (per_item * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        scaler.step(optimizer)
+        scaler.update()
+        if ema is not None:
+            ema.update(model)
+        total_loss += float((per_item.detach() * sample_weights).sum().cpu())
+        total_weight += float(sample_weights.sum().cpu())
+    return total_loss / max(total_weight, 1e-6)
+
+
+pseudo_test_probs = {}
+if ENABLE_STAGE2 and len(selected_indices) >= 10:
+    soft_items = make_soft_items()
+    soft_loader = loader(
+        SoftTargetDataset(soft_items, train_transform),
+        16,
+        shuffle=True,
+    )
+    print("\nStage 2 soft-target items:", len(soft_items))
+
+    for architecture in ARCHITECTURES:
+        print("Stage 2 student:", architecture)
+        model = build_model(architecture, pretrained=False)
+        model.load_state_dict(load_state(best_paths[architecture]))
+        ema = ModelEMA(model, decay=0.995)
+        set_backbone_trainable(model, architecture, trainable=True)
+        optimizer = make_optimizer(model, architecture, scale=0.20)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=PSEUDO_EPOCHS,
+            eta_min=1e-7,
+        )
+        scaler = make_scaler()
+        for epoch in range(1, PSEUDO_EPOCHS + 1):
+            loss = train_soft_epoch(model, soft_loader, optimizer, scaler, ema=ema)
+            scheduler.step()
+            print(f"  epoch {epoch:02d}/{PSEUDO_EPOCHS} | soft loss {loss:.5f}")
+        inference_batch_size = min(16, ARCH_CONFIG[architecture]["batch_size"])
+        test_loader = loader(test_dataset, inference_batch_size, shuffle=False)
+        test_crop_loader = loader(
+            test_crop_dataset,
+            inference_batch_size,
+            shuffle=False,
+        )
+        test_highres_loader = loader(
+            test_highres_dataset,
+            inference_batch_size,
+            shuffle=False,
+        )
+        test_highres_crop_loader = loader(
+            test_highres_crop_dataset,
+            inference_batch_size,
+            shuffle=False,
+        )
+        probs, ids_seen = predict_test_tta(
+            ema.module,
+            test_loader,
+            test_crop_loader,
+            test_highres_loader,
+            test_highres_crop_loader,
+        )
+        assert ids_seen == submission_template["ID"].tolist()
+        pseudo_test_probs[architecture] = probs
+        del (
+            model,
+            ema,
+            optimizer,
+            scheduler,
+            scaler,
+            test_loader,
+            test_crop_loader,
+            test_highres_loader,
+            test_highres_crop_loader,
+        )
+        gc.collect()
+        if USE_AMP:
+            torch.cuda.empty_cache()
+else:
+    reason = (
+        "disabled by PLANT_ENABLE_STAGE2"
+        if not ENABLE_STAGE2
+        else "too few reliable pseudo labels"
+    )
+    print(f"Skipping Stage 2: {reason}.")
+
+
+# -----------------------------------------------------------------------------
+# Final submission: preserve the template order and write one Kaggle CSV
+# -----------------------------------------------------------------------------
+
+def save_submission(probabilities, output_path):
+    probabilities = np.asarray(probabilities)
+    assert probabilities.ndim == 2
+    assert probabilities.shape == (len(submission_template), NUM_CLASSES)
+    predictions = probabilities.argmax(1)
+    prediction_by_id = {
+        image_id: CLASS_NAMES[int(prediction)]
+        for image_id, prediction in zip(submission_template["ID"], predictions)
+    }
+    submission = submission_template.copy()
+    submission["Category"] = submission["ID"].map(prediction_by_id)
+    assert submission["Category"].notna().all()
+    assert set(submission["Category"]).issubset(set(CLASS_NAMES))
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(output_path.name + ".tmp")
+    submission.to_csv(temporary_path, index=False)
+    os.replace(temporary_path, output_path)
+    print("Saved:", output_path)
+    print(submission["Category"].value_counts().sort_index())
+
+
+# Stage 2 is deliberately blended conservatively. The OOF-selected teacher
+# remains the fallback, so a small or noisy pseudo-label set cannot invalidate
+# the final submission.
+if pseudo_test_probs and ENABLE_STAGE2:
+    pseudo_probs = sum(
+        arch_weights[i] * pseudo_test_probs[arch_names[i]]
+        for i in range(len(arch_names))
+    )
+    final_probs = (1.0 - PSEUDO_BLEND) * teacher_probs + PSEUDO_BLEND * pseudo_probs
+else:
+    final_probs = teacher_probs
+
+final_output = OUTPUT_DIR / "submission.csv"
+save_submission(final_probs, final_output)
+print("\nFinal Kaggle submission:", final_output)
+print("Total minutes:", round((time.time() - overall_start) / 60.0, 1))
