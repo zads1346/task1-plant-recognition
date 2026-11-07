@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+_smoke_output/
+_smoke_deps/
+*.pt
+*.pth
+*.npy
+*.npz
+*.joblib
+*.csv
+*.log
+*.zip
+.idea/
+.vscode/
